@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>嵐々亭 勤怠</title>
+<style>body{font:18px/1.6 system-ui,sans-serif;margin:0;background:#f3f5f4;color:#172c24}main{max-width:520px;margin:auto;padding:24px}h1{font-size:26px}button,input{font:inherit;width:100%;box-sizing:border-box;padding:14px;border-radius:10px;border:1px solid #aaa;margin:8px 0}button{background:#006b45;color:white;border:0;cursor:pointer}button:disabled{opacity:.45;cursor:default}#punch{font-size:32px;padding:30px}#message{white-space:pre-wrap;padding:14px;background:white;border-radius:10px}.error{color:#b00020;border:2px solid #b00020}.success{color:#00613e;border:2px solid #00613e}li{padding:10px 0;border-bottom:1px solid #ccc}small{display:block}section{margin-top:24px}[hidden]{display:none!important}</style>
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script></head>
+<body><main><h1>嵐々亭 勤怠</h1><p id="who"></p><p id="warning" class="error" role="alert" hidden></p><p id="message" role="status" aria-live="polite">LINEで本人確認中…</p>
+<section id="registration" hidden><h2>初回登録</h2><label for="code">店長から受け取った登録コード</label><input id="code" type="text" inputmode="numeric" pattern="[0-9]{8}" minlength="8" maxlength="8" placeholder="8桁の数字" autocomplete="off" spellcheck="false"><button id="register">このLINEで登録する</button></section>
+<button id="punch" disabled hidden>確認中</button><button id="retry" hidden>同じ内容で再送する</button><button id="login" hidden>LINEに再ログインして再送</button><button id="refresh" hidden>最新の状態・履歴を確認</button>
+<section id="historySection" hidden><h2>本人の直近7日の履歴</h2><small id="window"></small><ul id="history"></ul></section>
+<small>シールをかざしただけでは打刻されません。下の記録完了表示まで確認してください。未送信がある間は新しい打刻を作りません。</small></main>
+<script>
+'use strict';
+// 公開設定のみ。秘密値・登録コード・スタッフ情報は書かない。
+const CONFIG = Object.freeze({
+  liffId: 'REPLACE_LIFF_ID',
+  apiUrl: 'REPLACE_GAS_EXEC_URL',
+  requestTimeoutMs: 30000,
+  retryBaseMs: 2000,
+  retryMaxMs: 60000
+});
+const $=id=>document.getElementById(id);
+let store='', owner='', nextKind='', sending=false, ready=false, timer=null, attempts=0;
+const pendingSlot='ranrantei-stage1-pending-v1:'+CONFIG.liffId;
+let pending=null;
+function message(text,css=''){ $('message').textContent=text; $('message').className=css; }
+function setBusy(v){sending=v; $('punch').disabled=v||!!pending||!ready; $('register').disabled=v; $('refresh').disabled=v||!!pending; $('retry').disabled=v;}
+function token(){const t=liff.getIDToken(); if(!t){const e=new Error('LINEに再ログインしてください。');e.code='AUTH';throw e;}return t;}
+function savePending(p){
+  // 保存できなければ送信しない。応答喪失時の同一キー再送を守る。
+  const existing=localStorage.getItem(pendingSlot);
+  if(existing&&JSON.parse(existing).key!==p.key)throw new Error('別の画面に未送信があります。この画面を開き直してください。');
+  localStorage.setItem(pendingSlot,JSON.stringify(p));
+  if(localStorage.getItem(pendingSlot)!==JSON.stringify(p))throw new Error('端末に送信キーを保存できません。');
+  pending=p;
+}
+function clearPending(){const saved=localStorage.getItem(pendingSlot);if(saved&&JSON.parse(saved).key===pending?.key)localStorage.removeItem(pendingSlot);pending=null;attempts=0;clearTimeout(timer);$('retry').hidden=true;$('login').hidden=true;}
+async function api(body){
+  const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),CONFIG.requestTimeoutMs);
+  try {
+    // text/plainはCORSプリフライトを避ける。no-corsは結果を読めないため使用しない。
+    const res=await fetch(CONFIG.apiUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=UTF-8'},body:JSON.stringify({...body,idToken:token()}),redirect:'follow',credentials:'omit',signal:controller.signal});
+    if(!res.ok)throw new Error('通信を確認できません。');
+    const result=await res.json();
+    if(!result.ok){const e=new Error(result.error.message);Object.assign(e,result.error);throw e;}
+    return result.data;
+  }finally{clearTimeout(timeout);}
+}
+function formatTime(s,tz){return new Intl.DateTimeFormat('ja-JP',{timeZone:tz,dateStyle:'short',timeStyle:'medium'}).format(new Date(s));}
+function showWarning(text){$('warning').textContent=text||'';$('warning').hidden=!text;}
+function renderStatus(data){
+  showWarning(data.warning);
+  $('registration').hidden=data.registered;
+  $('punch').hidden=!data.registered;$('refresh').hidden=!data.registered;
+  $('historySection').hidden=!data.registered;
+  if(!data.registered){message(data.storeName+'：初回登録してください。');return;}
+  $('who').textContent=data.staffName+' さん ／ '+data.storeName;
+  nextKind=data.nextKind; $('punch').textContent=nextKind+'する';
+  $('window').textContent=(data.historyMode==='CALENDAR_7_DAYS'?'今日を含む7暦日':'現在から168時間')+' ／ '+data.timezone+' ／ GAS受信時刻';
+  $('history').replaceChildren();
+  if(!data.history.length){const li=document.createElement('li');li.textContent='この期間の履歴はありません。';$('history').append(li);}
+  for(const item of data.history){const li=document.createElement('li');li.textContent=formatTime(item.receivedAt,data.timezone)+' '+item.kind+' ／ '+item.storeName+' ／ '+item.judgment+(item.reason?' ／ '+item.reason:'');$('history').append(li);}
+  ready=true;
+}
+async function loadStatus(keepMessage=false){
+  ready=false;setBusy(true);
+  try{renderStatus(await api({action:'status',store}));if(!keepMessage&&ready)message('確認してボタンを押してください。');}
+  catch(e){message('状態・履歴を取得できません。\n'+e.message,'error');$('refresh').hidden=false;if(e.code==='AUTH')$('login').hidden=false;}
+  finally{setBusy(false);}
+}
+function schedule(){clearTimeout(timer);const delay=Math.min(CONFIG.retryMaxMs,CONFIG.retryBaseMs*Math.pow(2,Math.min(attempts++,8)));timer=setTimeout(sendPending,delay);}
+async function sendPending(){
+  if(!pending||sending)return;
+  clearTimeout(timer);setBusy(true);$('retry').hidden=true;
+  try{
+    // この比較はアカウント切替時の誤操作防止だけ。本人確認の根拠はGASの検証API。
+    if(pending.owner!==owner){message('未送信：別のLINEアカウントで作成した打刻です。元のアカウントで開いてください。','error');return;}
+    const data=await api({action:'punch',store:pending.store,key:pending.key,kind:pending.kind,deviceAt:pending.deviceAt});
+    clearPending();
+    showWarning(data.warning);
+    const receiptWarning=data.warning;
+    message(data.receipt.kind+'を記録しました。\n受信日時：'+formatTime(data.receipt.receivedAt,data.timezone)+'\n記録ID：'+data.receipt.logId+(data.duplicate?'\n再送前の記録を確認しました。':''),'success');
+    // 成功後の履歴取得失敗で「打刻失敗」に見せない。
+    try{renderStatus(await api({action:'status',store}));}catch(e){$('refresh').hidden=false;}
+    if(receiptWarning)showWarning(receiptWarning);
+  }catch(e){
+    if(e.code==='AUTH'){
+      message('未送信：本人確認を更新する必要があります。同じ送信キーを保持しています。\n再ログイン後に再送します。','error');$('login').hidden=false;
+    }else if(e.code&&e.retryable===false){
+      // 確定拒否。新キーで自動再送しない。既存記録は変更しない。
+      clearPending();ready=false;message('打刻は受け付けられませんでした。\n'+e.message+'\n最新の履歴を確認してください。','error');$('refresh').hidden=false;
+    }else{
+      message('未送信（記録結果を未確認）：'+e.message+'\n同じ送信キーで自動再送します。この画面を開いたままお待ちください。','error');$('retry').hidden=false;schedule();
+    }
+  }finally{setBusy(false);}
+}
+$('punch').addEventListener('click',()=>{
+  if(sending||pending||!ready)return;
+  try{
+    const bytes=new Uint8Array(24);crypto.getRandomValues(bytes);
+    savePending({owner,store,key:Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join(''),kind:nextKind,deviceAt:new Date().toISOString()});
+    sendPending();
+  }catch(e){message('未送信：'+e.message+' 端末の保存設定を確認してください。','error');}
+});
+$('retry').addEventListener('click',sendPending);
+$('refresh').addEventListener('click',()=>loadStatus());
+$('login').addEventListener('click',()=>{liff.logout();liff.login({redirectUri:location.href});});
+$('register').addEventListener('click',async()=>{
+  setBusy(true);try{
+    await api({action:'register',store,registrationCode:$('code').value.trim()});$('code').value='';
+    message('登録しました。打刻ボタンはまだ押していません。','success');await loadStatus(true);
+  }catch(e){message('登録を確認できません。\n'+e.message+'\n応答が失われた場合も同じ登録コードでもう一度登録できます。','error');if(e.code==='AUTH')$('login').hidden=false;}
+  finally{setBusy(false);}
+});
+window.addEventListener('online',()=>{if(pending)sendPending();});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&pending)sendPending();});
+async function boot(){
+  try{
+    if(CONFIG.liffId.startsWith('REPLACE')||!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(CONFIG.apiUrl))throw new Error('管理者が公開設定を入力してください。');
+    await liff.init({liffId:CONFIG.liffId});
+    if(!liff.isLoggedIn()){liff.login({redirectUri:location.href});return;}
+    // liff.init完了後に読む。LIFFのリダイレクトで渡されるstoreに対応。
+    store=new URL(location.href).searchParams.get('store')||'';
+    owner=liff.getDecodedIDToken()?.sub||'';
+    if(!owner)throw new Error('openid権限を確認してください。');
+    const saved=localStorage.getItem(pendingSlot);if(saved){pending=JSON.parse(saved);if(!pending||!pending.key||!pending.owner||!pending.store||!pending.deviceAt||!['出勤','退勤'].includes(pending.kind))throw new Error('保存中の送信情報を確認できません。店長に連絡してください。');}
+    if(pending){message('未送信の打刻を同じ送信キーで再確認します。','error');await sendPending();}
+    else {if(!store)throw new Error('店舗のNFCシールから開いてください。');await loadStatus();}
+  }catch(e){message('未送信：'+e.message,'error');}
+}
+boot();
+</script></body></html>
